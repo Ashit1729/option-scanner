@@ -1,0 +1,2 @@
+run_date,ticker,direction,setup,price,zone_lo,zone_hi,trigger,invalid,expiry,strike,ask,spread_pct,oi,vol,iv_pct,cost,fits_cap,trigger_fired,fired_time,fired_price,invalidated,note
+2026-08-03 18:14 ET,SPY,CALL,breakout watch,757.67,745.53,758.45,758.45,745.53,2026-08-10,760.0,3.28,0.9,4026,7553,9.7,328.0,False,not_watched,,,N,
