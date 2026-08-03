@@ -1,0 +1,30 @@
+# SAVE AT:  .github/workflows/grade.yml
+#
+# Posts the weekly scorecard to Discord every Friday ~5:05 PM ET
+# (21:05 UTC is after the close in both EDT and EST, so one cron is enough).
+# Read-only: it never modifies the journal.
+
+name: Weekly Grader
+
+on:
+  schedule:
+    - cron: '5 21 * * 5'
+  workflow_dispatch: {}
+
+jobs:
+  grade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run grader
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python grader.py
