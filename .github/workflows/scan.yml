@@ -1,0 +1,53 @@
+# REPLACES your existing file at:  .github/workflows/scan.yml
+#
+# v2: starts earlier (~9:37 ET) so the scan posts near the open and the
+# watcher then polls 5-min candles until 10:35 ET, pinging Discord the
+# moment a trigger fires. Two crons handle US daylight saving; the script's
+# Eastern-time gate makes sure only one of them proceeds each day.
+# Scheduled off the hour/half-hour because those slots run late on GitHub.
+
+name: Daily Options Scanner
+
+on:
+  schedule:
+    - cron: '37 13 * * 1-5'   # 9:37 AM ET in summer (EDT)
+    - cron: '37 14 * * 1-5'   # 9:37 AM ET in winter (EST)
+  workflow_dispatch:
+    inputs:
+      watch:
+        description: 'Also run the intraday watch loop (runs ~1 hour)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner (+ watcher on scheduled runs)
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+          WATCH: ${{ github.event_name == 'schedule' && '1' || (inputs.watch && '1' || '0') }}
+        run: python scanner.py
+
+      - name: Commit journal
+        run: |
+          git config user.name "scanner-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git pull --rebase || true
+          git add journal.csv || true
+          git commit -m "journal $(date -u +%F)" || echo "nothing to commit"
+          git push || echo "nothing to push"
