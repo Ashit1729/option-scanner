@@ -41,7 +41,7 @@ WATCHLIST = ["NVDA", "AAPL", "GOOGL", "MSFT", "AMZN",
              "LLY", "TSLA", "AMD", "XOM", "JNJ",
              "V", "WMT", "MA", "CSCO", "ABBV", "QQQ" , "SPY", "IWM"]
 
-MAX_RISK = 200.0          # worst case on a long option = the full premium
+MAX_RISK = 400.0          # worst case on a long option = the full premium
 MAX_NEW_PER_SCAN = 5      # new cards per 30-min rescan
 MAX_ACTIVE = 15           # ceiling on simultaneously watched setups
 
