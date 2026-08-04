@@ -40,10 +40,10 @@ ET = ZoneInfo("America/New_York")
 WATCHLIST = ["NVDA", "AAPL", "GOOGL", "MSFT", "AMZN",
              "AVGO", "META", "JPM", "BRK-B", "MU",
              "LLY", "TSLA", "AMD", "XOM", "JNJ",
-             "V", "WMT", "MA", "CSCO", "ABBV", "SPY", "QQQ", "IWM"]
+             "V", "WMT", "MA", "CSCO", "ABBV"]
 
 ACCOUNT_SIZE = 1000.0     # used only to show risk as a % of your account
-MAX_RISK = 400.0          # worst case on a long option = the full premium
+MAX_RISK = 200.0          # worst case on a long option = the full premium
                           # NOTE: this now gates the ESTIMATED ENTRY cost,
                           # not the current ask, because you buy later.
 DELTA_TARGET = 0.45       # preferred delta at entry
@@ -56,7 +56,7 @@ MAX_ACTIVE = 15           # ceiling on simultaneously watched setups
 PIVOT_WINGS = 2
 ZONE_CLUSTER_PCT = 0.006
 MIN_TOUCHES = 2
-NEAR_PCT = 0.02
+NEAR_PCT = 0.012
 
 # Liquidity gates (Lesson 2)
 MIN_OI = 500
@@ -646,6 +646,50 @@ def load_state() -> list:
         return []
 
 
+def post_results(fresh: list, active: list, quiet_if_empty: bool = True) -> int:
+    """Turn rescan output into Discord cards. Returns how many were posted."""
+    cards, skips = [], []
+    for c in fresh:
+        if "contract" in c:
+            active.append(c)
+            cards.append(build_card(c, c["contract"], c.get("earn_note", "")))
+            log_candidate(c)
+        else:
+            skips.append(f"⏭️ {c['ticker']} {c['direction']} setup found "
+                         f"but skipped: {c['reject']}.")
+    if not cards and not skips:
+        if not quiet_if_empty:
+            discord("🪑 **No setup right now.** Nothing cleared the trend, "
+                    "zone, liquidity and cost filters. That is the system "
+                    "working, not failing.")
+        return 0
+    stamp = now_et().strftime("%H:%M ET")
+    discord(f"🎯 **Scan {stamp}** — {len(cards)} setup(s). "
+            f"Delayed data; verify at your broker.")
+    for card in cards:
+        discord(card)
+    if skips:
+        discord("\n".join(skips))
+    return len(cards)
+
+
+def test_pass() -> None:
+    """Manual run outside the session window: do ONE scan on the most recent
+    data and stop. Lets you prove the scan logic works at any hour."""
+    discord(f"🧪 **TEST RUN {now_et():%H:%M} ET** — outside the "
+            f"{SESSION.upper()} window, so this is a single scan on the most "
+            f"recent daily bars. No live watching, no trigger pings. "
+            f"Cards below are for checking the plumbing, NOT for trading.")
+    try:
+        fresh = rescan(set(), 0)
+    except Exception as e:
+        discord(f"❌ Test scan failed: {type(e).__name__}: {e}")
+        return
+    post_results(fresh, [], quiet_if_empty=False)
+    discord("🧪 Test complete. Scheduled sessions run the full loop with "
+            "30-min rescans and live trigger pings.")
+
+
 def main() -> None:
     if SESSION not in SESSIONS:
         print("Unknown SESSION:", SESSION)
@@ -688,16 +732,22 @@ def main() -> None:
                 f"{late} min late ({now_et():%H:%M} ET). GitHub queued or "
                 f"delayed it, so today's coverage is shorter than usual.")
 
-    if SESSION == "am":
+    if FORCE_RUN and mins_now() >= hm(end):
+        pass                       # banner suppressed; test_pass() speaks
+    elif SESSION == "am":
         discord(f"🌅 **{today} — AM session live.** Watching {len(WATCHLIST)} "
                 f"names, rescanning every 30 min until 12:40, then the PM "
                 f"session takes over until 16:05. {paper_status()}")
-    else:
+    elif SESSION == "pm":
         discord(f"🌇 **PM session live** — carrying {len(active)} setup(s) "
                 f"from this morning, still rescanning every 30 min "
                 f"until 16:05.")
 
     end_mins = hm(end)
+    if FORCE_RUN and mins_now() >= end_mins:
+        test_pass()
+        return
+
     last_scan = 0.0
     while mins_now() < end_mins:
         if time.time() - last_scan >= RESCAN_EVERY:
@@ -708,24 +758,7 @@ def main() -> None:
                 except Exception as e:
                     fresh = []
                     print("rescan error:", e)
-                cards, skips = [], []
-                for c in fresh:
-                    if "contract" in c:
-                        active.append(c)
-                        cards.append(build_card(c, c["contract"],
-                                                c.get("earn_note", "")))
-                        log_candidate(c)
-                    else:
-                        skips.append(f"⏭️ {c['ticker']} {c['direction']} "
-                                     f"setup found but skipped: {c['reject']}.")
-                if cards or skips:
-                    stamp = now_et().strftime("%H:%M ET")
-                    discord(f"🎯 **Scan {stamp}** — {len(cards)} setup(s). "
-                            f"Delayed data; verify at your broker.")
-                    for card in cards:
-                        discord(card)
-                    if skips:
-                        discord("\n".join(skips))
+                post_results(fresh, active)
         try:
             poll(active)
         except Exception as e:
