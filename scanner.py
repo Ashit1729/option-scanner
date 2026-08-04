@@ -22,6 +22,7 @@ the card, remains the primary real-time layer.
 import csv
 import datetime as dt
 import json
+import math
 import os
 import time
 from zoneinfo import ZoneInfo
@@ -39,9 +40,15 @@ ET = ZoneInfo("America/New_York")
 WATCHLIST = ["NVDA", "AAPL", "GOOGL", "MSFT", "AMZN",
              "AVGO", "META", "JPM", "BRK-B", "MU",
              "LLY", "TSLA", "AMD", "XOM", "JNJ",
-             "V", "WMT", "MA", "CSCO", "ABBV", "QQQ" , "SPY", "IWM"]
+             "V", "WMT", "MA", "CSCO", "ABBV"]
 
-MAX_RISK = 400.0          # worst case on a long option = the full premium
+ACCOUNT_SIZE = 1000.0     # used only to show risk as a % of your account
+MAX_RISK = 200.0          # worst case on a long option = the full premium
+                          # NOTE: this now gates the ESTIMATED ENTRY cost,
+                          # not the current ask, because you buy later.
+DELTA_TARGET = 0.45       # preferred delta at entry
+DELTA_MIN, DELTA_MAX = 0.30, 0.60
+RISK_FREE = 0.04          # only used for the Black-Scholes estimate
 MAX_NEW_PER_SCAN = 5      # new cards per 30-min rescan
 MAX_ACTIVE = 15           # ceiling on simultaneously watched setups
 
@@ -49,7 +56,7 @@ MAX_ACTIVE = 15           # ceiling on simultaneously watched setups
 PIVOT_WINGS = 2
 ZONE_CLUSTER_PCT = 0.006
 MIN_TOUCHES = 2
-NEAR_PCT = 0.02
+NEAR_PCT = 0.012
 
 # Liquidity gates (Lesson 2)
 MIN_OI = 500
@@ -77,9 +84,12 @@ MACRO_EVENTS = {
 # Sessions (ET). Gap between them so AM can commit state before PM checks out.
 SESSIONS = {"am": ((9, 30), (12, 40)),
             "pm": ((12, 45), (16, 5))}
-START_GRACE = 50          # a session may only BEGIN within this many minutes
-                          # of its window opening. Stops the second
-                          # daylight-saving cron running a duplicate session.
+START_GRACE = 180         # a session may only BEGIN within this many minutes
+                          # of its window opening. Generous, because a run
+                          # queued behind another job can start very late and
+                          # should still work. Duplicate daylight-saving crons
+                          # are filtered by wrong_dst_twin() instead.
+LATE_START_WARN = 30      # tell Discord if a session starts this late
 
 NO_NEW_AFTER = (15, 30)       # stop opening new ideas this late
 OVERNIGHT_WARN_AFTER = (15, 0)
@@ -151,6 +161,50 @@ def batch_history(symbols, period, interval):
         except Exception:
             continue
     return out
+
+
+def _ncdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _npdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def bs(S, K, T, sig, call=True, r=RISK_FREE):
+    """Black-Scholes price, delta and per-CALENDAR-DAY theta.
+    Yahoo gives no greeks, so we derive them from the chain's own IV.
+    These are model estimates — your broker's numbers are authoritative."""
+    if T <= 0 or sig <= 0 or S <= 0 or K <= 0:
+        intrinsic = max(0.0, (S - K) if call else (K - S))
+        return {"price": intrinsic, "delta": 1.0 if intrinsic > 0 else 0.0,
+                "theta": 0.0}
+    d1 = (math.log(S / K) + (r + sig * sig / 2) * T) / (sig * math.sqrt(T))
+    d2 = d1 - sig * math.sqrt(T)
+    disc = math.exp(-r * T)
+    if call:
+        price = S * _ncdf(d1) - K * disc * _ncdf(d2)
+        delta = _ncdf(d1)
+        theta = (-S * _npdf(d1) * sig / (2 * math.sqrt(T))
+                 - r * K * disc * _ncdf(d2)) / 365.0
+    else:
+        price = K * disc * _ncdf(-d2) - S * _ncdf(-d1)
+        delta = _ncdf(d1) - 1.0
+        theta = (-S * _npdf(d1) * sig / (2 * math.sqrt(T))
+                 + r * K * disc * _ncdf(-d2)) / 365.0
+    return {"price": price, "delta": delta, "theta": theta}
+
+
+def project_entry_ask(ask, spot, trigger, K, T, sig, call):
+    """You are told to WAIT for the trigger, so you buy after the stock has
+    already moved. Scale today's ask by the model's price ratio between
+    here and the trigger. Estimate only — never a quote."""
+    here = bs(spot, K, T, sig, call)["price"]
+    there = bs(trigger, K, T, sig, call)["price"]
+    if here <= 0.01:
+        return ask
+    ratio = min(max(there / here, 1.0), 3.0)
+    return ask * ratio
 
 
 def find_zones(df: pd.DataFrame) -> list:
@@ -232,9 +286,10 @@ def earnings_within(sym: str, days: int = 3):
         return None
 
 
-def pick_contract(sym: str, direction: str, trigger: float):
-    """Walk every expiry in the DTE window, nearest strikes first.
-    Returns the first contract passing BOTH liquidity gates and the $ cap."""
+def pick_contract(sym: str, direction: str, trigger: float, spot: float):
+    """Score every liquid strike near the trigger and return the one whose
+    delta AT ENTRY is closest to DELTA_TARGET, gated on the ESTIMATED entry
+    cost rather than the current ask."""
     t = yf.Ticker(sym)
     today = now_et().date()
     expiries = []
@@ -248,44 +303,83 @@ def pick_contract(sym: str, direction: str, trigger: float):
     if not expiries:
         return None, f"no expiry in {MIN_DTE}-{MAX_DTE} DTE window"
 
-    liquid_but_pricey = None
-    for exp, dte in expiries:
+    call = direction == "CALL"
+    cands, too_pricey = [], None
+    for exp, dte in expiries[:4]:
         try:
             chain = t.option_chain(exp)
         except Exception:
             continue
-        df = (chain.calls if direction == "CALL" else chain.puts).copy()
+        df = (chain.calls if call else chain.puts).copy()
         df["volume"] = df["volume"].fillna(0)
         df["openInterest"] = df["openInterest"].fillna(0)
-        if direction == "CALL":
+        if call:
             df = df[df["strike"] >= trigger].sort_values("strike")
         else:
-            df = df[df["strike"] <= trigger].sort_values("strike", ascending=False)
-
-        for _, r in df.head(4).iterrows():
+            df = df[df["strike"] <= trigger].sort_values("strike",
+                                                         ascending=False)
+        T = max(dte, 1) / 365.0
+        for _, r in df.head(8).iterrows():
             bid, ask = float(r["bid"]), float(r["ask"])
-            if bid <= 0 or ask <= 0:
+            iv = float(r["impliedVolatility"] or 0)
+            if bid <= 0 or ask <= 0 or iv <= 0:
                 continue
             spread = ask - bid
             if spread > max(0.05, MAX_SPREAD_PCT * ask):
                 continue
             if int(r["openInterest"]) < MIN_OI:
                 continue
-            k = {"expiry": exp, "dte": dte, "strike": float(r["strike"]),
+            K = float(r["strike"])
+            g = bs(trigger, K, T, iv, call)        # greeks AT ENTRY
+            entry_ask = project_entry_ask(ask, spot, trigger, K, T, iv, call)
+            k = {"expiry": exp, "dte": dte, "strike": K,
                  "bid": bid, "ask": ask, "spread_pct": spread / ask * 100,
                  "oi": int(r["openInterest"]), "vol": int(r["volume"]),
-                 "iv_pct": float(r["impliedVolatility"] or 0) * 100,
-                 "cost": ask * 100}
-            if k["cost"] <= MAX_RISK:
-                return k, None
-            if liquid_but_pricey is None:
-                liquid_but_pricey = k
+                 "iv_pct": iv * 100, "cost": ask * 100,
+                 "entry_ask": entry_ask, "entry_cost": entry_ask * 100,
+                 "delta": g["delta"], "theta": g["theta"],
+                 "theta_pct": (abs(g["theta"]) / max(entry_ask, 0.01)) * 100}
+            if k["entry_cost"] > MAX_RISK:
+                if too_pricey is None or k["entry_cost"] < too_pricey["entry_cost"]:
+                    too_pricey = k
+                continue
+            cands.append(k)
         time.sleep(0.4)
 
-    if liquid_but_pricey:
-        return None, (f"cheapest liquid contract is "
-                      f"${liquid_but_pricey['cost']:.0f} > ${MAX_RISK:.0f} cap")
-    return None, "no strike passed liquidity gates"
+    if not cands:
+        if too_pricey:
+            return None, (f"cheapest liquid contract would cost about "
+                          f"${too_pricey['entry_cost']:.0f} at the trigger "
+                          f"(> ${MAX_RISK:.0f} cap)")
+        return None, "no strike passed liquidity gates"
+
+    cands.sort(key=lambda c: abs(abs(c["delta"]) - DELTA_TARGET))
+    best = cands[0]
+    best["delta_ok"] = DELTA_MIN <= abs(best["delta"]) <= DELTA_MAX
+    return best, None
+
+
+def wrong_dst_twin() -> bool:
+    """Each session has two crons, one for EDT and one for EST, because
+    GitHub cron is always UTC. Exactly one is correct on any given day.
+    The workflow passes the cron string through CRON_SCHEDULE; we compare
+    its UTC hour against what the current Eastern offset implies."""
+    cron = os.environ.get("CRON_SCHEDULE", "").strip()
+    if not cron:
+        return False                      # manual run: no cron to check
+    try:
+        cron_hour = int(cron.split()[1])
+    except (IndexError, ValueError):
+        return False
+    is_dst = bool(now_et().dst())
+    expected = {"am": 13, "pm": 16} if is_dst else {"am": 14, "pm": 17}
+    want = expected.get(SESSION)
+    if want is None or cron_hour == want:
+        return False
+    print(f"cron {cron!r} is the "
+          f"{'EST' if is_dst else 'EDT'} twin but today is "
+          f"{'EDT' if is_dst else 'EST'}; exiting so the correct one runs.")
+    return True
 
 
 def paper_status() -> str:
@@ -352,30 +446,82 @@ def log_candidate(c: dict) -> None:
 
 
 def build_card(c: dict, k: dict, earn_note: str) -> str:
-    vol_warn = ("" if k["vol"] >= MIN_VOL_WARN
-                else " ⚠️ low volume so far today — recheck before entry.")
-    side = "C" if c["direction"] == "CALL" else "P"
-    above = "above" if c["direction"] == "CALL" else "below"
-    below = "below" if c["direction"] == "CALL" else "above"
-    late = ("\n🌙 Late session — a hold past 16:00 carries overnight gap risk, "
-            "and a gap can cost the FULL premium regardless of your stop."
+    """Readable card: a monospaced block for the numbers, plain text for
+    the plan. Every price is labelled with WHEN it applies."""
+    call = c["direction"] == "CALL"
+    side = "Call" if call else "Put"
+    arrow = "🟢" if call else "🔴"
+    above, below = ("above", "below") if call else ("below", "above")
+
+    exp_date = dt.date.fromisoformat(k["expiry"])
+    exp_txt = exp_date.strftime("%a %d %b %Y")
+    dist = (c["trigger"] - c["price"]) / c["price"] * 100
+    inval = (c["invalid"] - c["price"]) / c["price"] * 100
+
+    # stock move needed for +10% on the option, solved on the model
+    T = max(k["dte"], 1) / 365.0
+    tgt_prem = k["entry_ask"] * 1.10
+    lo, hi = c["trigger"], c["trigger"] * (1.15 if call else 0.85)
+    for _ in range(50):
+        mid = (lo + hi) / 2
+        px = bs(mid, k["strike"], T, k["iv_pct"] / 100, call)["price"]
+        if (px < tgt_prem) == call:
+            lo = mid
+        else:
+            hi = mid
+    tgt_stock = hi
+    tgt_move = (tgt_stock - c["trigger"]) / c["trigger"] * 100
+
+    pct_acct = k["entry_cost"] / ACCOUNT_SIZE * 100
+    delta_flag = "" if k.get("delta_ok", True) else "  ⚠️ outside 0.30-0.60"
+    theta_flag = "" if k["theta_pct"] <= 8 else "  ⚠️ heavy decay"
+    vol_flag = "" if k["vol"] >= MIN_VOL_WARN else "  ⚠️ thin today"
+
+    block = (
+        f"STOCK\n"
+        f"  price now      ${c['price']:>9.2f}\n"
+        f"  enter above    ${c['trigger']:>9.2f}   {dist:+.2f}% away\n"
+        f"  wrong below    ${c['invalid']:>9.2f}   {inval:+.2f}%\n"
+        f"  zone           {c['lo']:.2f} - {c['hi']:.2f}   {c['touches']} touches\n"
+        f"\n"
+        f"CONTRACT   ${k['strike']:.0f} {side}\n"
+        f"  expires        {exp_txt}   ({k['dte']} days)\n"
+        f"  ask right now  ${k['ask']:>9.2f}   = ${k['cost']:.0f}\n"
+        f"  est. AT ENTRY  ${k['entry_ask']:>9.2f}   = ${k['entry_cost']:.0f}"
+        f"   <- what you pay\n"
+        f"  bid / spread   ${k['bid']:.2f} / {k['spread_pct']:.1f}%\n"
+        f"  OI / volume    {k['oi']:,} / {k['vol']:,}{vol_flag}\n"
+        f"  IV             {k['iv_pct']:.0f}%\n"
+        f"  delta          {k['delta']:+.2f}{delta_flag}\n"
+        f"  theta          -${abs(k['theta']) * 100:.0f}/day "
+        f"({k['theta_pct']:.0f}% of premium){theta_flag}\n"
+        f"\n"
+        f"RISK\n"
+        f"  est. cost      ${k['entry_cost']:.0f}   = {pct_acct:.0f}% of "
+        f"${ACCOUNT_SIZE:,.0f}\n"
+        f"  max loss       ${k['entry_cost']:.0f}   (full premium on a gap)\n"
+        f"\n"
+        f"+10% TARGET\n"
+        f"  option         ${tgt_prem:.2f}   = ${tgt_prem * 100:.0f}\n"
+        f"  needs stock    ${tgt_stock:.2f}   {tgt_move:+.2f}% past trigger\n"
+    )
+
+    late = ("\n🌙 Late session — holding past 16:00 risks an overnight gap, "
+            "which can cost the FULL premium regardless of your stop."
             if mins_now() >= hm(OVERNIGHT_WARN_AFTER) else "")
+
     return (
-        f"**{c['ticker']} — {c['setup']} ({c['direction']})**  "
-        f"[{c['trend']}trend]{earn_note}\n"
-        f"Price {c['price']:.2f} | zone {c['lo']:.2f}–{c['hi']:.2f} "
-        f"({c['touches']} touches)\n"
-        f"Contract: {k['expiry']} ({k['dte']}DTE) ${k['strike']:.1f}{side} | "
-        f"bid {k['bid']:.2f} / ask {k['ask']:.2f} (spread {k['spread_pct']:.1f}%) | "
-        f"OI {k['oi']:,} | vol {k['vol']:,}{vol_warn} | IV {k['iv_pct']:.0f}%\n"
-        f"💵 1 contract = ${k['cost']:.0f} premium at risk "
-        f"({k['cost'] / 1000 * 100:.0f}% of a $1,000 account)\n"
-        f"📍 Set a broker price alert at **{c['trigger']:.2f}** now (backup layer).\n"
-        f"Enter ONLY if a 5-min candle CLOSES {above} {c['trigger']:.2f} "
-        f"on above-average volume.\n"
-        f"Wrong the moment a 5-min candle closes back {below} "
-        f"{c['invalid']:.2f} → exit.\n"
-        f"At broker, confirm: delta 0.35–0.50, theta/day ≤ 8% of premium.{late}"
+        f"{arrow} **{c['ticker']} · {c['direction']} · {c['setup']}** "
+        f"· {c['trend']}trend{earn_note}\n"
+        f"```\n{block}```\n"
+        f"📍 **Set a broker alert at {c['trigger']:.2f} now.**\n"
+        f"✅ Enter only if a 5-min candle CLOSES {above} "
+        f"{c['trigger']:.2f} on above-average volume.\n"
+        f"🛑 Wrong the moment a 5-min candle closes {below} "
+        f"{c['invalid']:.2f} — exit.\n"
+        f"🔍 Greeks above are Black-Scholes estimates from the chain's IV, "
+        f"and the entry price is a projection. Confirm both on your broker's "
+        f"live chain before you buy.{late}"
     )
 
 
@@ -410,7 +556,7 @@ def rescan(seen: set, active_count: int) -> list:
             continue
         c["earn_note"] = ("" if earn is False
                           else " ⚠️ earnings date unverified — check before trading.")
-        k, why = pick_contract(sym, c["direction"], c["trigger"])
+        k, why = pick_contract(sym, c["direction"], c["trigger"], c["price"])
         if k is None:
             seen.add(key)      # don't retry a rejected setup every 30 min
             c["reject"] = why
@@ -505,6 +651,9 @@ def main() -> None:
         print("Unknown SESSION:", SESSION)
         return
     start, end = SESSIONS[SESSION]
+    if not FORCE_RUN and wrong_dst_twin():
+        return
+
     latest_start = min(hm(start) + START_GRACE, hm(end))
     if not FORCE_RUN and not (hm(start) <= mins_now() <= latest_start):
         print(f"{SESSION}: now {now_et():%H:%M} ET, may only start between "
@@ -532,6 +681,12 @@ def main() -> None:
 
     active = load_state() if SESSION == "pm" else []
     seen = {(c["ticker"], c["direction"], round(c["trigger"], 2)) for c in active}
+
+    late = mins_now() - hm(start)
+    if late >= LATE_START_WARN and not FORCE_RUN:
+        discord(f"⏳ Heads up: the {SESSION.upper()} session started "
+                f"{late} min late ({now_et():%H:%M} ET). GitHub queued or "
+                f"delayed it, so today's coverage is shorter than usual.")
 
     if SESSION == "am":
         discord(f"🌅 **{today} — AM session live.** Watching {len(WATCHLIST)} "
@@ -565,8 +720,12 @@ def main() -> None:
                                      f"setup found but skipped: {c['reject']}.")
                 if cards or skips:
                     stamp = now_et().strftime("%H:%M ET")
-                    discord(f"🎯 **Scan {stamp}** (delayed data — verify at "
-                            f"broker)\n\n" + "\n\n".join(cards + skips))
+                    discord(f"🎯 **Scan {stamp}** — {len(cards)} setup(s). "
+                            f"Delayed data; verify at your broker.")
+                    for card in cards:
+                        discord(card)
+                    if skips:
+                        discord("\n".join(skips))
         try:
             poll(active)
         except Exception as e:
