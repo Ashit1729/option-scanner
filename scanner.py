@@ -1,20 +1,28 @@
 """
-Daily options setup scanner + intraday trigger watcher — v2
-Phase 1 (scan, ~9:50 ET): find setups, post trade cards to Discord.
-Phase 2 (watch, until 10:35 ET): poll 5-min candles; ping the moment a
-  trigger CLOSES through its level on above-average volume, ping again if
-  the invalidation closes, and post the 10:30 time-stop reminder.
-Phase 3: journal every candidate WITH its outcome for the weekly grader.
+Full-day options setup scanner — v3
 
-It never places trades. Free Yahoo data can lag ~15 min on option quotes;
-5-min price bars are near-real-time but not guaranteed. Your broker price
-alert (set from the morning card) stays the primary real-time layer.
+Runs in two sessions because GitHub caps a single job at 6 hours and the
+US session is 6.5:
+    AM session  9:35 -> 12:40 ET
+    PM session 12:50 -> 16:05 ET
+State is handed from AM to PM via state.json so a setup found at 10:15
+is still being watched at 14:00.
+
+Each session loops:
+  - every 30 min: rescan all 20 tickers for NEW setups -> post a trade card
+  - every 2 min : poll 5-min bars on every active setup
+                  -> ping when a trigger CLOSES through its level
+                  -> ping when an entered setup CLOSES through invalidation
+
+It never places trades. Yahoo option quotes can lag ~15 min; 5-min bars
+are near-real-time but not guaranteed. Your broker price alert, set from
+the card, remains the primary real-time layer.
 """
 
 import csv
 import datetime as dt
+import json
 import os
-import sys
 import time
 from zoneinfo import ZoneInfo
 
@@ -25,11 +33,17 @@ import yfinance as yf
 ET = ZoneInfo("America/New_York")
 
 # ----------------------------- CONFIG ---------------------------------------
-WATCHLIST = ["SPY", "QQQ", "IWM", "AAPL", "AMZN", "NVDA",
-             "MSFT", "TSLA", "META", "GOOGL","AVGO", "MU" , "JPM", "AMD" , "INTC" , "ORCL" ]
+# Top 20 S&P 500 companies by index weight, verified 2026-08-03 12:15 ET
+# (chartrow.com, SEC N-PORT filing rolled forward on price).
+# Recheck quarterly — this ordering drifts.
+WATCHLIST = ["NVDA", "AAPL", "GOOGL", "MSFT", "AMZN",
+             "AVGO", "META", "JPM", "BRK-B", "MU",
+             "LLY", "TSLA", "AMD", "XOM", "JNJ",
+             "V", "WMT", "MA", "CSCO", "ABBV", "QQQ" , "SPY", "IWM"]
 
-MAX_RISK = 100.0          # worst case on a long option = full premium
-MAX_CANDIDATES = 2
+MAX_RISK = 200.0          # worst case on a long option = the full premium
+MAX_NEW_PER_SCAN = 5      # new cards per 30-min rescan
+MAX_ACTIVE = 15           # ceiling on simultaneously watched setups
 
 # Zone detection (Lesson 3)
 PIVOT_WINGS = 2
@@ -43,39 +57,43 @@ MIN_VOL_WARN = 100
 MAX_SPREAD_PCT = 0.05
 
 # Contract selection (Lesson 1)
-MIN_DTE, MAX_DTE = 5, 12
+MIN_DTE, MAX_DTE = 5, 30
 
 # Paper period
 PAPER_START = dt.date(2026, 8, 3)
 PAPER_WEEKS = 4
 
-# Macro stand-down days (verified 2026-07-31). UPDATE MONTHLY:
-#   CPI  -> bls.gov/schedule/news_release/cpi.htm
-#   FOMC -> federalreserve.gov/monetarypolicy/fomccalendars.htm
+# Macro stand-down days. UPDATE MONTHLY:
+#   CPI/NFP -> bls.gov/schedule/news_release/
+#   FOMC    -> federalreserve.gov/monetarypolicy/fomccalendars.htm
 MACRO_EVENTS = {
+    "2026-08-07": "Jobs report (NFP) 8:30 ET",
     "2026-08-12": "CPI release 8:30 ET",
     "2026-09-16": "FOMC decision 2:00 ET",
     "2026-10-28": "FOMC decision 2:00 ET",
     "2026-12-09": "FOMC decision 2:00 ET",
 }
 
-# Timing (all ET)
-GATE_START = (9, 35)      # scan may start from here...
-GATE_END = (10, 20)       # ...until here (covers late GitHub starts)
-TIME_STOP = (10, 30)      # your decision deadline
-WATCH_END = (10, 35)      # watcher hard stop
-CHECK_EVERY = 150         # seconds between polls
+# Sessions (ET). Gap between them so AM can commit state before PM checks out.
+SESSIONS = {"am": ((9, 35), (12, 40)),
+            "pm": ((12, 50), (16, 5))}
+
+NO_NEW_AFTER = (15, 30)       # stop opening new ideas this late
+OVERNIGHT_WARN_AFTER = (15, 0)
+RESCAN_EVERY = 1800           # seconds between full watchlist rescans
+CHECK_EVERY = 120             # seconds between 5-min bar polls
 
 JOURNAL = "journal.csv"
-JOURNAL_FIELDS = ["run_date", "ticker", "direction", "setup", "price",
-                  "zone_lo", "zone_hi", "trigger", "invalid", "expiry",
-                  "strike", "ask", "spread_pct", "oi", "vol", "iv_pct",
-                  "cost", "fits_cap", "trigger_fired", "fired_time",
+STATE = "state.json"
+JOURNAL_FIELDS = ["run_date", "session", "ticker", "direction", "setup",
+                  "price", "zone_lo", "zone_hi", "trigger", "invalid",
+                  "expiry", "strike", "ask", "spread_pct", "oi", "vol",
+                  "iv_pct", "cost", "fits_cap", "trigger_fired", "fired_time",
                   "fired_price", "invalidated", "note"]
 
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
+SESSION = os.environ.get("SESSION", "am").lower()
 FORCE_RUN = os.environ.get("FORCE_RUN", "0") == "1"
-WATCH = os.environ.get("WATCH", "0") == "1"
 # -----------------------------------------------------------------------------
 
 
@@ -88,10 +106,8 @@ def mins_now() -> int:
     return t.hour * 60 + t.minute
 
 
-def within_gate() -> bool:
-    return (GATE_START[0] * 60 + GATE_START[1]
-            <= mins_now()
-            <= GATE_END[0] * 60 + GATE_END[1])
+def hm(t) -> int:
+    return t[0] * 60 + t[1]
 
 
 def discord(msg: str) -> None:
@@ -104,6 +120,34 @@ def discord(msg: str) -> None:
         except Exception as e:
             print("Discord post failed:", e)
         time.sleep(0.5)
+
+
+def to_et(df: pd.DataFrame) -> pd.DataFrame:
+    idx = df.index
+    idx = (idx.tz_convert("America/New_York") if idx.tz is not None
+           else idx.tz_localize("America/New_York"))
+    return df.set_axis(idx)
+
+
+def batch_history(symbols, period, interval):
+    """One HTTP call for the whole watchlist. Returns {sym: DataFrame}."""
+    try:
+        raw = yf.download(symbols, period=period, interval=interval,
+                          group_by="ticker", auto_adjust=False,
+                          progress=False, threads=False)
+    except Exception as e:
+        print("batch download failed:", e)
+        return {}
+    out = {}
+    for s in symbols:
+        try:
+            df = raw[s] if isinstance(raw.columns, pd.MultiIndex) else raw
+            df = df.dropna(how="all")
+            if not df.empty:
+                out[s] = df
+        except Exception:
+            continue
+    return out
 
 
 def find_zones(df: pd.DataFrame) -> list:
@@ -126,13 +170,11 @@ def find_zones(df: pd.DataFrame) -> list:
     return [z for z in zones if z["touches"] >= MIN_TOUCHES]
 
 
-def scan_ticker(sym: str):
-    t = yf.Ticker(sym)
-    df = t.history(period="6mo", interval="1d")
+def setup_from_daily(sym: str, df: pd.DataFrame, live_price: float):
+    """Find the best zone near the CURRENT price. Returns (cand, reason)."""
     if df is None or len(df) < 60:
         return None, "no data"
-
-    price = float(df["Close"].iloc[-1])
+    price = live_price if live_price else float(df["Close"].iloc[-1])
     ema20 = float(df["Close"].ewm(span=20, adjust=False).mean().iloc[-1])
     ema50 = float(df["Close"].ewm(span=50, adjust=False).mean().iloc[-1])
 
@@ -164,13 +206,14 @@ def scan_ticker(sym: str):
 
     best.update({"ticker": sym, "price": price, "trend": trend,
                  "fired": False, "invalidated": False,
-                 "fired_time": "", "fired_price": ""})
+                 "fired_time": "", "fired_price": "", "logged": False})
     return best, None
 
 
-def earnings_within(t: yf.Ticker, days: int = 3):
+def earnings_within(sym: str, days: int = 3):
+    """True / False / None(unknown). yfinance earnings data is unreliable."""
     try:
-        cal = t.calendar
+        cal = yf.Ticker(sym).calendar
         dates = []
         if isinstance(cal, dict):
             dates = cal.get("Earnings Date", []) or []
@@ -187,40 +230,58 @@ def earnings_within(t: yf.Ticker, days: int = 3):
 
 
 def pick_contract(sym: str, direction: str, trigger: float):
+    """Walk every expiry in the DTE window, nearest strikes first.
+    Returns the first contract passing BOTH liquidity gates and the $ cap."""
     t = yf.Ticker(sym)
     today = now_et().date()
-    expiry = dte = None
+    expiries = []
     for exp in (t.options or []):
-        d = (dt.date.fromisoformat(exp) - today).days
+        try:
+            d = (dt.date.fromisoformat(exp) - today).days
+        except ValueError:
+            continue
         if MIN_DTE <= d <= MAX_DTE:
-            expiry, dte = exp, d
-            break
-    if expiry is None:
-        return None, "no expiry in 5-12 DTE window"
+            expiries.append((exp, d))
+    if not expiries:
+        return None, f"no expiry in {MIN_DTE}-{MAX_DTE} DTE window"
 
-    chain = t.option_chain(expiry)
-    df = (chain.calls if direction == "CALL" else chain.puts).copy()
-    df["volume"] = df["volume"].fillna(0)
-    df["openInterest"] = df["openInterest"].fillna(0)
-    if direction == "CALL":
-        df = df[df["strike"] >= trigger].sort_values("strike")
-    else:
-        df = df[df["strike"] <= trigger].sort_values("strike", ascending=False)
+    liquid_but_pricey = None
+    for exp, dte in expiries:
+        try:
+            chain = t.option_chain(exp)
+        except Exception:
+            continue
+        df = (chain.calls if direction == "CALL" else chain.puts).copy()
+        df["volume"] = df["volume"].fillna(0)
+        df["openInterest"] = df["openInterest"].fillna(0)
+        if direction == "CALL":
+            df = df[df["strike"] >= trigger].sort_values("strike")
+        else:
+            df = df[df["strike"] <= trigger].sort_values("strike", ascending=False)
 
-    for _, r in df.head(4).iterrows():
-        bid, ask = float(r["bid"]), float(r["ask"])
-        if bid <= 0 or ask <= 0:
-            continue
-        spread = ask - bid
-        if spread > max(0.05, MAX_SPREAD_PCT * ask):
-            continue
-        if int(r["openInterest"]) < MIN_OI:
-            continue
-        return {"expiry": expiry, "dte": dte, "strike": float(r["strike"]),
-                "bid": bid, "ask": ask, "spread_pct": spread / ask * 100,
-                "oi": int(r["openInterest"]), "vol": int(r["volume"]),
-                "iv_pct": float(r["impliedVolatility"] or 0) * 100,
-                "cost": ask * 100}, None
+        for _, r in df.head(4).iterrows():
+            bid, ask = float(r["bid"]), float(r["ask"])
+            if bid <= 0 or ask <= 0:
+                continue
+            spread = ask - bid
+            if spread > max(0.05, MAX_SPREAD_PCT * ask):
+                continue
+            if int(r["openInterest"]) < MIN_OI:
+                continue
+            k = {"expiry": exp, "dte": dte, "strike": float(r["strike"]),
+                 "bid": bid, "ask": ask, "spread_pct": spread / ask * 100,
+                 "oi": int(r["openInterest"]), "vol": int(r["volume"]),
+                 "iv_pct": float(r["impliedVolatility"] or 0) * 100,
+                 "cost": ask * 100}
+            if k["cost"] <= MAX_RISK:
+                return k, None
+            if liquid_but_pricey is None:
+                liquid_but_pricey = k
+        time.sleep(0.4)
+
+    if liquid_but_pricey:
+        return None, (f"cheapest liquid contract is "
+                      f"${liquid_but_pricey['cost']:.0f} > ${MAX_RISK:.0f} cap")
     return None, "no strike passed liquidity gates"
 
 
@@ -230,7 +291,29 @@ def paper_status() -> str:
         return "PAPER MODE (starts week of Aug 3)"
     if week <= PAPER_WEEKS:
         return f"PAPER MODE — week {week}/{PAPER_WEEKS}. No real orders yet."
-    return "Live-eligible — 1 contract max, only if the journal hit-rate justifies it."
+    return "Live-eligible — 1 contract max, only if the journal justifies it."
+
+
+def migrate_journal() -> None:
+    """v2 journals lack the 'session' column. Rewrite the header once so
+    appended rows stay aligned instead of silently shifting."""
+    if not os.path.exists(JOURNAL):
+        return
+    try:
+        with open(JOURNAL, newline="") as f:
+            rows = list(csv.reader(f))
+        if not rows or rows[0] == JOURNAL_FIELDS:
+            return
+        old = rows[0]
+        with open(JOURNAL, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=JOURNAL_FIELDS)
+            w.writeheader()
+            for r in rows[1:]:
+                d = dict(zip(old, r))
+                w.writerow({k: d.get(k, "") for k in JOURNAL_FIELDS})
+        print("journal.csv migrated to v3 schema")
+    except Exception as e:
+        print("journal migration skipped:", e)
 
 
 def journal_row(row: dict) -> None:
@@ -243,17 +326,37 @@ def journal_row(row: dict) -> None:
         w.writerow(full)
 
 
+def log_candidate(c: dict) -> None:
+    if c.get("logged"):
+        return
+    k = c.get("contract", {})
+    journal_row({"run_date": now_et().strftime("%Y-%m-%d %H:%M ET"),
+                 "session": SESSION, "ticker": c["ticker"],
+                 "direction": c["direction"], "setup": c["setup"],
+                 "price": round(c["price"], 2), "zone_lo": round(c["lo"], 2),
+                 "zone_hi": round(c["hi"], 2), "trigger": round(c["trigger"], 2),
+                 "invalid": round(c["invalid"], 2), "expiry": k.get("expiry", ""),
+                 "strike": k.get("strike", ""), "ask": k.get("ask", ""),
+                 "spread_pct": round(k.get("spread_pct", 0), 1),
+                 "oi": k.get("oi", ""), "vol": k.get("vol", ""),
+                 "iv_pct": round(k.get("iv_pct", 0), 1),
+                 "cost": round(k.get("cost", 0), 0),
+                 "fits_cap": k.get("cost", 1e9) <= MAX_RISK,
+                 "trigger_fired": "Y" if c["fired"] else "N",
+                 "fired_time": c["fired_time"], "fired_price": c["fired_price"],
+                 "invalidated": "Y" if c["invalidated"] else "N"})
+    c["logged"] = True
+
+
 def build_card(c: dict, k: dict, earn_note: str) -> str:
-    fits = k["cost"] <= MAX_RISK
-    size_line = (f"✅ 1 contract = ${k['cost']:.0f} premium at risk"
-                 if fits else
-                 f"❌ ${k['cost']:.0f} premium exceeds the ${MAX_RISK:.0f} cap → "
-                 f"paper-log only, or wait for the spreads lesson. Do NOT size up.")
     vol_warn = ("" if k["vol"] >= MIN_VOL_WARN
                 else " ⚠️ low volume so far today — recheck before entry.")
     side = "C" if c["direction"] == "CALL" else "P"
     above = "above" if c["direction"] == "CALL" else "below"
     below = "below" if c["direction"] == "CALL" else "above"
+    late = ("\n🌙 Late session — a hold past 16:00 carries overnight gap risk, "
+            "and a gap can cost the FULL premium regardless of your stop."
+            if mins_now() >= hm(OVERNIGHT_WARN_AFTER) else "")
     return (
         f"**{c['ticker']} — {c['setup']} ({c['direction']})**  "
         f"[{c['trend']}trend]{earn_note}\n"
@@ -262,177 +365,228 @@ def build_card(c: dict, k: dict, earn_note: str) -> str:
         f"Contract: {k['expiry']} ({k['dte']}DTE) ${k['strike']:.1f}{side} | "
         f"bid {k['bid']:.2f} / ask {k['ask']:.2f} (spread {k['spread_pct']:.1f}%) | "
         f"OI {k['oi']:,} | vol {k['vol']:,}{vol_warn} | IV {k['iv_pct']:.0f}%\n"
-        f"{size_line}\n"
-        f"📍 Set a broker/TradingView price alert at **{c['trigger']:.2f}** now "
-        f"(backup layer).\n"
+        f"💵 1 contract = ${k['cost']:.0f} premium at risk "
+        f"({k['cost'] / 1000 * 100:.0f}% of a $1,000 account)\n"
+        f"📍 Set a broker price alert at **{c['trigger']:.2f}** now (backup layer).\n"
         f"Enter ONLY if a 5-min candle CLOSES {above} {c['trigger']:.2f} "
         f"on above-average volume.\n"
         f"Wrong the moment a 5-min candle closes back {below} "
         f"{c['invalid']:.2f} → exit.\n"
-        f"At broker, confirm: delta 0.35–0.50, theta/day ≤ 8% of premium."
+        f"At broker, confirm: delta 0.35–0.50, theta/day ≤ 8% of premium.{late}"
     )
 
 
-def completed_5m_bars(sym: str):
-    """Today's COMPLETED 5-min bars only (drops the still-forming bar)."""
-    try:
-        df = yf.Ticker(sym).history(period="1d", interval="5m")
+def rescan(seen: set, active_count: int) -> list:
+    """Full watchlist sweep. Returns new candidate dicts with contracts."""
+    daily = batch_history(WATCHLIST, "6mo", "1d")
+    intraday = batch_history(WATCHLIST, "1d", "5m")
+    found = []
+    for sym in WATCHLIST:
+        if active_count + len(found) >= MAX_ACTIVE or len(found) >= MAX_NEW_PER_SCAN:
+            break
+        df = daily.get(sym)
+        if df is None:
+            continue
+        live = None
+        idf = intraday.get(sym)
+        if idf is not None and not idf.empty:
+            live = float(idf["Close"].iloc[-1])
+        try:
+            c, _ = setup_from_daily(sym, df, live)
+        except Exception:
+            continue
+        if c is None:
+            continue
+        key = (c["ticker"], c["direction"], round(c["trigger"], 2))
+        if key in seen:
+            continue
+
+        earn = earnings_within(sym)
+        if earn is True:
+            seen.add(key)
+            continue
+        c["earn_note"] = ("" if earn is False
+                          else " ⚠️ earnings date unverified — check before trading.")
+        k, why = pick_contract(sym, c["direction"], c["trigger"])
+        if k is None:
+            seen.add(key)      # don't retry a rejected setup every 30 min
+            c["reject"] = why
+            found.append(c)    # reported as a skip line, not watched
+            continue
+        c["contract"] = k
+        found.append(c)
+        seen.add(key)
+    return found
+
+
+def poll(active: list) -> None:
+    """One batched 5-min bar fetch, then check every active setup."""
+    syms = sorted({c["ticker"] for c in active if not c["invalidated"]})
+    if not syms:
+        return
+    bars = batch_history(syms, "1d", "5m")
+    ts_now = pd.Timestamp.now(tz="America/New_York")
+    for c in active:
+        if c["invalidated"] or "contract" not in c:
+            continue
+        df = bars.get(c["ticker"])
         if df is None or df.empty:
-            return None
-        idx = df.index
-        idx = (idx.tz_convert("America/New_York") if idx.tz is not None
-               else idx.tz_localize("America/New_York"))
-        df = df.set_axis(idx)
-        ts_now = pd.Timestamp.now(tz="America/New_York")
-        df = df[df.index + pd.Timedelta(minutes=5) <= ts_now]
-        return df if not df.empty else None
-    except Exception:
-        return None
+            continue
+        try:
+            df = to_et(df)
+            df = df[df.index + pd.Timedelta(minutes=5) <= ts_now]
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        bar = df.iloc[-1]
+        close, vol = float(bar["Close"]), float(bar["Volume"])
+        avg_vol = float(df["Volume"].mean())
+        is_call = c["direction"] == "CALL"
 
-
-def watch_loop(cands: list) -> None:
-    end_mins = WATCH_END[0] * 60 + WATCH_END[1]
-    stop_mins = TIME_STOP[0] * 60 + TIME_STOP[1]
-    pinged_timestop = False
-
-    while mins_now() < end_mins:
-        for c in cands:
-            df = completed_5m_bars(c["ticker"])
-            if df is None:
+        if not c["fired"]:
+            if mins_now() >= hm(NO_NEW_AFTER):
                 continue
-            bar = df.iloc[-1]
-            close, vol = float(bar["Close"]), float(bar["Volume"])
-            avg_vol = float(df["Volume"].mean())
-            is_call = c["direction"] == "CALL"
+            hit = close > c["trigger"] if is_call else close < c["trigger"]
+            if hit and vol >= avg_vol:
+                c["fired"] = True
+                c["fired_time"] = df.index[-1].strftime("%H:%M")
+                c["fired_price"] = round(close, 2)
+                discord(f"🔔 **{c['ticker']} TRIGGER FIRED** {c['fired_time']} ET "
+                        f"— 5-min close {close:.2f} "
+                        f"{'above' if is_call else 'below'} {c['trigger']:.2f} "
+                        f"on {vol / max(avg_vol, 1):.1f}x avg volume.\n"
+                        f"Contract: {c['contract']['expiry']} "
+                        f"${c['contract']['strike']:.1f}"
+                        f"{'C' if is_call else 'P'} "
+                        f"(~${c['contract']['cost']:.0f}).\n"
+                        f"Confirm the candle on YOUR chart and check the live "
+                        f"chain before anything else. Invalid if a 5-min close "
+                        f"goes back {'below' if is_call else 'above'} "
+                        f"{c['invalid']:.2f}. {paper_status()}")
+        else:
+            bad = close < c["invalid"] if is_call else close > c["invalid"]
+            if bad:
+                c["invalidated"] = True
+                discord(f"❌ **{c['ticker']} INVALIDATED** — 5-min close "
+                        f"{close:.2f} through {c['invalid']:.2f}. "
+                        f"The setup is wrong. If you entered, exit. "
+                        f"No revenge trades, no averaging down.")
+                log_candidate(c)
 
-            if not c["fired"]:
-                hit = close > c["trigger"] if is_call else close < c["trigger"]
-                if hit and vol >= avg_vol:
-                    c["fired"] = True
-                    c["fired_time"] = df.index[-1].strftime("%H:%M")
-                    c["fired_price"] = round(close, 2)
-                    discord(f"🔔 **{c['ticker']} TRIGGER FIRED** "
-                            f"{c['fired_time']} ET — 5-min close {close:.2f} "
-                            f"{'above' if is_call else 'below'} {c['trigger']:.2f} "
-                            f"on {vol/avg_vol:.1f}x avg volume.\n"
-                            f"Confirm the candle on YOUR chart, check the live "
-                            f"chain, then decide. Invalid if a 5-min close goes "
-                            f"back {'below' if is_call else 'above'} "
-                            f"{c['invalid']:.2f}. {paper_status()}")
-            elif not c["invalidated"]:
-                bad = close < c["invalid"] if is_call else close > c["invalid"]
-                if bad:
-                    c["invalidated"] = True
-                    discord(f"❌ **{c['ticker']} INVALIDATED** — 5-min close "
-                            f"{close:.2f} through {c['invalid']:.2f}. "
-                            f"The setup is wrong. If you entered, exit now. "
-                            f"No revenge trades.")
 
-        if not pinged_timestop and mins_now() >= stop_mins:
-            pinged_timestop = True
-            if any(c["fired"] for c in cands):
-                discord("⏰ **10:30 ET time stop.** If a trade isn't working, "
-                        "close it. If it is working, manage it — trail your "
-                        "invalidation, don't invent new targets.")
-            else:
-                discord("⏰ 10:30 ET — no trigger fired. The day is over for "
-                        "this system. Standing down.")
-                return
-        time.sleep(CHECK_EVERY)
+def save_state(active: list) -> None:
+    keep = [{k: v for k, v in c.items() if k != "earn_note"}
+            for c in active if not c["invalidated"] and "contract" in c]
+    try:
+        with open(STATE, "w") as f:
+            json.dump({"date": now_et().date().isoformat(),
+                       "active": keep}, f)
+    except Exception as e:
+        print("state save failed:", e)
+
+
+def load_state() -> list:
+    try:
+        with open(STATE) as f:
+            data = json.load(f)
+        if data.get("date") != now_et().date().isoformat():
+            return []
+        return data.get("active", [])
+    except Exception:
+        return []
 
 
 def main() -> None:
-    if not FORCE_RUN and not within_gate():
-        print("Outside scan window; exiting (expected for one of the two crons).")
+    if SESSION not in SESSIONS:
+        print("Unknown SESSION:", SESSION)
+        return
+    start, end = SESSIONS[SESSION]
+    if not FORCE_RUN and not (hm(start) <= mins_now() <= hm(end)):
+        print(f"Outside {SESSION} window; exiting (expected for one DST cron).")
         return
 
-    today = now_et().date()
-    tstamp = now_et().strftime("%Y-%m-%d %H:%M ET")
+    migrate_journal()
 
+    today = now_et().date()
     label = MACRO_EVENTS.get(today.isoformat())
     if label:
-        discord(f"⚠️ **{today} — macro day: {label}.**\n"
-                f"Stand down. No scan, no trades today.")
+        if SESSION == "am":
+            discord(f"⚠️ **{today} — macro day: {label}.**\n"
+                    f"Stand down. No scan, no trades today.")
         return
 
     spy = yf.Ticker("SPY").history(period="5d", interval="1d")
     if spy is None or spy.empty or spy.index[-1].date() != today:
         if not FORCE_RUN:
-            print("Market appears closed today; exiting quietly.")
+            print("Market appears closed; exiting quietly.")
             return
-        print("Note: no fresh SPY bar; continuing because FORCE_RUN=1.")
+        print("No fresh SPY bar; continuing because FORCE_RUN=1.")
 
-    candidates, reasons = [], []
-    for sym in WATCHLIST:
+    active = load_state() if SESSION == "pm" else []
+    seen = {(c["ticker"], c["direction"], round(c["trigger"], 2)) for c in active}
+
+    if SESSION == "am":
+        discord(f"🌅 **{today} — AM session live.** Watching {len(WATCHLIST)} "
+                f"names, rescanning every 30 min until 12:40, then the PM "
+                f"session takes over until 16:05. {paper_status()}")
+    else:
+        discord(f"🌇 **PM session live** — carrying {len(active)} setup(s) "
+                f"from this morning, still rescanning every 30 min "
+                f"until 16:05.")
+
+    end_mins = hm(end)
+    last_scan = 0.0
+    while mins_now() < end_mins:
+        if time.time() - last_scan >= RESCAN_EVERY:
+            last_scan = time.time()
+            if mins_now() < hm(NO_NEW_AFTER):
+                try:
+                    fresh = rescan(seen, len([c for c in active if not c["invalidated"]]))
+                except Exception as e:
+                    fresh = []
+                    print("rescan error:", e)
+                cards, skips = [], []
+                for c in fresh:
+                    if "contract" in c:
+                        active.append(c)
+                        cards.append(build_card(c, c["contract"],
+                                                c.get("earn_note", "")))
+                        log_candidate(c)
+                    else:
+                        skips.append(f"⏭️ {c['ticker']} {c['direction']} "
+                                     f"setup found but skipped: {c['reject']}.")
+                if cards or skips:
+                    stamp = now_et().strftime("%H:%M ET")
+                    discord(f"🎯 **Scan {stamp}** (delayed data — verify at "
+                            f"broker)\n\n" + "\n\n".join(cards + skips))
         try:
-            cand, why = scan_ticker(sym)
-            if cand is None:
-                reasons.append(f"{sym}: {why}")
-            else:
-                candidates.append(cand)
+            poll(active)
         except Exception as e:
-            reasons.append(f"{sym}: data error ({type(e).__name__})")
-        time.sleep(1)
+            print("poll error:", e)
+        time.sleep(CHECK_EVERY)
 
-    candidates.sort(key=lambda c: (-c["touches"], c["dist"]))
-    candidates = candidates[:MAX_CANDIDATES]
+    for c in active:
+        log_candidate(c)
 
-    kept = []
-    cards = [f"🎯 **Scan {tstamp}** (data delayed — verify at broker)"]
-    for c in candidates:
-        earn = earnings_within(yf.Ticker(c["ticker"]))
-        if earn is True:
-            cards.append(f"⏭️ **{c['ticker']}** skipped: earnings within 3 days "
-                         f"(IV crush risk).")
-            continue
-        earn_note = ("" if earn is False
-                     else " ⚠️ earnings date unverified — check before trading.")
-        k, why = pick_contract(c["ticker"], c["direction"], c["trigger"])
-        if k is None:
-            cards.append(f"⏭️ **{c['ticker']} {c['direction']}** setup found but "
-                         f"no tradeable contract: {why}.")
-            continue
-        c["contract"] = k
-        kept.append(c)
-        cards.append(build_card(c, k, earn_note))
-
-    if not kept:
-        cards.append("🪑 **No tradeable setup today. Sit out.** That is the "
-                     "system working, not failing.\n"
-                     + "\n".join(f"• {r}" for r in reasons[:10]))
-        discord("\n\n".join(cards))
-        journal_row({"run_date": tstamp, "ticker": "-", "setup": "no_setup",
-                     "note": "; ".join(reasons)[:400]})
-        return
-
-    if WATCH:
-        cards.append(f"👁️ Watcher live until {WATCH_END[0]}:{WATCH_END[1]:02d} ET — "
-                     f"I'll ping when a trigger fires. Broker alert stays the backup.")
-    cards.append(f"🧾 {paper_status()}\nNothing here is financial advice or a "
-                 f"prediction. It is your own checklist, automated.")
-    discord("\n\n".join(cards))
-
-    if WATCH:
-        watch_loop(kept)
-
-    for c in kept:
-        k = c["contract"]
-        journal_row({"run_date": tstamp, "ticker": c["ticker"],
-                     "direction": c["direction"], "setup": c["setup"],
-                     "price": round(c["price"], 2), "zone_lo": round(c["lo"], 2),
-                     "zone_hi": round(c["hi"], 2),
-                     "trigger": round(c["trigger"], 2),
-                     "invalid": round(c["invalid"], 2), "expiry": k["expiry"],
-                     "strike": k["strike"], "ask": k["ask"],
-                     "spread_pct": round(k["spread_pct"], 1), "oi": k["oi"],
-                     "vol": k["vol"], "iv_pct": round(k["iv_pct"], 1),
-                     "cost": round(k["cost"], 0),
-                     "fits_cap": k["cost"] <= MAX_RISK,
-                     "trigger_fired": "Y" if c["fired"] else
-                                      ("N" if WATCH else "not_watched"),
-                     "fired_time": c["fired_time"],
-                     "fired_price": c["fired_price"],
-                     "invalidated": "Y" if c["invalidated"] else "N"})
+    if SESSION == "am":
+        save_state(active)
+        print("AM done; state handed to PM.")
+    else:
+        live = [c for c in active if c["fired"] and not c["invalidated"]]
+        if live:
+            discord("🔔 **16:05 — close.** You still show "
+                    f"{len(live)} triggered setup(s) open. Anything held "
+                    f"overnight risks a gap, and a gap can cost the full "
+                    f"premium no matter where your stop sits. Decide "
+                    f"deliberately, not by default.")
+        else:
+            discord("🌙 **16:05 — close.** Nothing left open. "
+                    "Quiet days cost nothing; forced trades do.")
+        try:
+            os.remove(STATE)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
