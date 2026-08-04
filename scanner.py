@@ -57,7 +57,7 @@ MIN_VOL_WARN = 100
 MAX_SPREAD_PCT = 0.05
 
 # Contract selection (Lesson 1)
-MIN_DTE, MAX_DTE = 5, 30
+MIN_DTE, MAX_DTE = 2, 30
 
 # Paper period
 PAPER_START = dt.date(2026, 8, 3)
