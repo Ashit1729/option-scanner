@@ -37,9 +37,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 240        # under GitHub's hard 6-hour job ceiling
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -50,6 +50,7 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+          CRON_SCHEDULE: ${{ github.event.schedule }}
           # Scheduled runs before 15:00 UTC are the AM session; later = PM.
           SESSION: >-
             ${{ github.event_name == 'workflow_dispatch'
