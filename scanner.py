@@ -43,7 +43,7 @@ WATCHLIST = ["NVDA", "AAPL", "GOOGL", "MSFT", "AMZN",
              "V", "WMT", "MA", "CSCO", "ABBV", "QQQ", "IWM", "SPY"]
 
 ACCOUNT_SIZE = 1000.0     # used only to show risk as a % of your account
-MAX_RISK = 900.0          # worst case on a long option = the full premium
+MAX_RISK = 400.0          # worst case on a long option = the full premium
                           # NOTE: this now gates the ESTIMATED ENTRY cost,
                           # not the current ask, because you buy later.
 DELTA_TARGET = 0.45       # preferred delta at entry
@@ -56,7 +56,7 @@ MAX_ACTIVE = 15           # ceiling on simultaneously watched setups
 PIVOT_WINGS = 2
 ZONE_CLUSTER_PCT = 0.006
 MIN_TOUCHES = 2
-NEAR_PCT = 0.08
+NEAR_PCT = 0.02
 
 # Liquidity gates (Lesson 2)
 MIN_OI = 500
@@ -64,7 +64,7 @@ MIN_VOL_WARN = 100
 MAX_SPREAD_PCT = 0.05
 
 # Contract selection (Lesson 1)
-MIN_DTE, MAX_DTE = 3, 30
+MIN_DTE, MAX_DTE = 5, 30
 
 # Paper period
 PAPER_START = dt.date(2026, 8, 3)
