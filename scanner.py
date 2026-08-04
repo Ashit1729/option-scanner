@@ -505,8 +505,12 @@ def main() -> None:
         print("Unknown SESSION:", SESSION)
         return
     start, end = SESSIONS[SESSION]
-    if not FORCE_RUN and not (hm(start) <= mins_now() <= hm(end)):
-        print(f"Outside {SESSION} window; exiting (expected for one DST cron).")
+    latest_start = min(hm(start) + START_GRACE, hm(end))
+    if not FORCE_RUN and not (hm(start) <= mins_now() <= latest_start):
+        print(f"{SESSION}: now {now_et():%H:%M} ET, may only start between "
+              f"{hm(start)//60:02d}:{hm(start)%60:02d} and "
+              f"{latest_start//60:02d}:{latest_start%60:02d}. Exiting "
+              f"(expected for one of the two daylight-saving crons).")
         return
 
     migrate_journal()
