@@ -26,7 +26,7 @@ ET = ZoneInfo("America/New_York")
 
 # ----------------------------- CONFIG ---------------------------------------
 WATCHLIST = ["SPY", "QQQ", "IWM", "AAPL", "AMZN", "NVDA",
-             "MSFT", "TSLA", "META", "GOOGL"]
+             "MSFT", "TSLA", "META", "GOOGL","AVGO", "MU" , "JPM", "AMD" , "INTC" , "ORCL" ]
 
 MAX_RISK = 100.0          # worst case on a long option = full premium
 MAX_CANDIDATES = 2
