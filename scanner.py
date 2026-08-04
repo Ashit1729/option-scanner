@@ -49,7 +49,7 @@ MAX_ACTIVE = 15           # ceiling on simultaneously watched setups
 PIVOT_WINGS = 2
 ZONE_CLUSTER_PCT = 0.006
 MIN_TOUCHES = 2
-NEAR_PCT = 0.012
+NEAR_PCT = 0.02
 
 # Liquidity gates (Lesson 2)
 MIN_OI = 500
@@ -57,7 +57,7 @@ MIN_VOL_WARN = 100
 MAX_SPREAD_PCT = 0.05
 
 # Contract selection (Lesson 1)
-MIN_DTE, MAX_DTE = 2, 30
+MIN_DTE, MAX_DTE = 5, 30
 
 # Paper period
 PAPER_START = dt.date(2026, 8, 3)
