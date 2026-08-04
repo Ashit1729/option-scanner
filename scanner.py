@@ -75,8 +75,11 @@ MACRO_EVENTS = {
 }
 
 # Sessions (ET). Gap between them so AM can commit state before PM checks out.
-SESSIONS = {"am": ((9, 35), (12, 40)),
-            "pm": ((12, 50), (16, 5))}
+SESSIONS = {"am": ((9, 30), (12, 40)),
+            "pm": ((12, 45), (16, 5))}
+START_GRACE = 50          # a session may only BEGIN within this many minutes
+                          # of its window opening. Stops the second
+                          # daylight-saving cron running a duplicate session.
 
 NO_NEW_AFTER = (15, 30)       # stop opening new ideas this late
 OVERNIGHT_WARN_AFTER = (15, 0)
