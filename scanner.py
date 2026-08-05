@@ -40,10 +40,10 @@ ET = ZoneInfo("America/New_York")
 WATCHLIST = ["NVDA", "AAPL", "GOOGL", "MSFT", "AMZN",
              "AVGO", "META", "JPM", "BRK-B", "MU",
              "LLY", "TSLA", "AMD", "XOM", "JNJ",
-             "V", "WMT", "MA", "CSCO", "ABBV"]
+             "V", "WMT", "MA", "CSCO", "ABBV","QQQ", "IWM", "SPY"]
 
 ACCOUNT_SIZE = 1000.0     # used only to show risk as a % of your account
-MAX_RISK = 200.0          # worst case on a long option = the full premium
+MAX_RISK = 400.0          # worst case on a long option = the full premium
                           # NOTE: this now gates the ESTIMATED ENTRY cost,
                           # not the current ask, because you buy later.
 MAX_PREMIUM = 4.00        # max per-share ask, i.e. $400 per contract.
@@ -60,7 +60,7 @@ MAX_ACTIVE = 15           # ceiling on simultaneously watched setups
 PIVOT_WINGS = 2
 ZONE_CLUSTER_PCT = 0.006
 MIN_TOUCHES = 2
-NEAR_PCT = 0.012
+NEAR_PCT = 0.02
 
 # Liquidity gates (Lesson 2)
 MIN_OI = 500
