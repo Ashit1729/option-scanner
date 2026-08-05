@@ -28,8 +28,12 @@ on:
 permissions:
   contents: write
 
+# Each cron gets its OWN concurrency group, and manual runs get another.
+# Previously everything shared one group, so a manual run left going would
+# make the scheduled run queue behind it - and a queued run that starts too
+# late exits without posting. Separate groups mean they never block.
 concurrency:
-  group: scanner
+  group: scanner-${{ github.event.schedule || 'manual' }}
   cancel-in-progress: false
 
 jobs:
