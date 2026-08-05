@@ -40,7 +40,7 @@ ET = ZoneInfo("America/New_York")
 WATCHLIST = ["NVDA", "AAPL", "GOOGL", "MSFT", "AMZN",
              "AVGO", "META", "JPM", "BRK-B", "MU",
              "LLY", "TSLA", "AMD", "XOM", "JNJ",
-             "V", "WMT", "MA", "CSCO", "ABBV", "QQQ", "SPY", "IWM"]
+             "V", "WMT", "MA", "CSCO", "ABBV", "QQQ", "IWM", "SPY"]
 
 ACCOUNT_SIZE = 1000.0     # used only to show risk as a % of your account
 MAX_RISK = 400.0          # worst case on a long option = the full premium
@@ -60,7 +60,7 @@ MAX_ACTIVE = 15           # ceiling on simultaneously watched setups
 PIVOT_WINGS = 2
 ZONE_CLUSTER_PCT = 0.006
 MIN_TOUCHES = 2
-NEAR_PCT = 0.02
+NEAR_PCT = 0.020
 
 # Liquidity gates (Lesson 2)
 MIN_OI = 500
@@ -88,6 +88,8 @@ MACRO_EVENTS = {
 # Sessions (ET). Gap between them so AM can commit state before PM checks out.
 SESSIONS = {"am": ((9, 30), (12, 40)),
             "pm": ((12, 45), (16, 5))}
+FALLBACK_SPAN = 45        # crons scheduled within this many minutes of a
+                          # session opening are treated as valid fallbacks
 START_GRACE = 180         # a session may only BEGIN within this many minutes
                           # of its window opening. Generous, because a run
                           # queued behind another job can start very late and
@@ -366,26 +368,33 @@ def pick_contract(sym: str, direction: str, trigger: float, spot: float):
     return best, None
 
 
-def wrong_dst_twin() -> bool:
-    """Each session has two crons, one for EDT and one for EST, because
-    GitHub cron is always UTC. Exactly one is correct on any given day.
-    The workflow passes the cron string through CRON_SCHEDULE; we compare
-    its UTC hour against what the current Eastern offset implies."""
+def cron_not_for_this_session() -> bool:
+    """GitHub cron is always UTC, so each session has several crons: primary
+    plus fallbacks, doubled for EDT and EST. Rather than hard-code which is
+    which, convert THIS cron's UTC time into Eastern and keep it only if it
+    lands inside the session's opening span. Everything else exits in
+    seconds, which is how the duplicates filter themselves out."""
     cron = os.environ.get("CRON_SCHEDULE", "").strip()
     if not cron:
-        return False                      # manual run: no cron to check
+        return False                      # manual run: nothing to check
     try:
-        cron_hour = int(cron.split()[1])
+        parts = cron.split()
+        mm, hh = int(parts[0]), int(parts[1])
     except (IndexError, ValueError):
         return False
-    is_dst = bool(now_et().dst())
-    expected = {"am": 13, "pm": 16} if is_dst else {"am": 14, "pm": 17}
-    want = expected.get(SESSION)
-    if want is None or cron_hour == want:
+    now_utc = now_et().astimezone(dt.timezone.utc)
+    cron_et = now_utc.replace(hour=hh, minute=mm, second=0,
+                              microsecond=0).astimezone(ET)
+    ct = cron_et.hour * 60 + cron_et.minute
+    start = SESSIONS[SESSION][0]
+    if hm(start) <= ct <= hm(start) + FALLBACK_SPAN:
         return False
-    print(f"cron {cron!r} is the "
-          f"{'EST' if is_dst else 'EDT'} twin but today is "
-          f"{'EDT' if is_dst else 'EST'}; exiting so the correct one runs.")
+    print(f"cron {cron!r} = {cron_et:%H:%M} ET, which is outside the "
+          f"{SESSION.upper()} opening span "
+          f"{hm(start)//60:02d}:{hm(start)%60:02d}-"
+          f"{(hm(start)+FALLBACK_SPAN)//60:02d}:"
+          f"{(hm(start)+FALLBACK_SPAN)%60:02d}. Exiting; this is a "
+          f"daylight-saving duplicate and another cron covers today.")
     return True
 
 
@@ -767,7 +776,7 @@ def main() -> None:
         print("Unknown SESSION:", SESSION)
         return
     start, end = SESSIONS[SESSION]
-    if not FORCE_RUN and wrong_dst_twin():
+    if not FORCE_RUN and cron_not_for_this_session():
         return
 
     latest_start = min(hm(start) + START_GRACE, hm(end))
