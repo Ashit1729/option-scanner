@@ -1,0 +1,54 @@
+# SAVE AT:  .github/workflows/scan-am.yml
+#
+# Morning session, 9:30 -> 12:40 ET.
+# Three crons per daylight-saving regime, 20 minutes apart. GitHub's free
+# scheduler routinely drops or delays a slot, so if 9:32 never fires, 9:52
+# tries, then 10:12. The scanner keeps whichever starts FIRST and the rest
+# exit in seconds, because they share one concurrency group.
+
+name: Scanner AM
+
+on:
+  schedule:
+    - cron: '32 13 * * 1-5'   # 9:32 ET summer
+    - cron: '52 13 * * 1-5'   # 9:52 ET summer  (fallback)
+    - cron: '12 14 * * 1-5'   # 10:12 ET summer (fallback)
+    - cron: '32 14 * * 1-5'   # 9:32 ET winter
+    - cron: '52 14 * * 1-5'   # 9:52 ET winter  (fallback)
+    - cron: '12 15 * * 1-5'   # 10:12 ET winter (fallback)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scanner-am
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run AM scanner
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SESSION: am
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+          CRON_SCHEDULE: ${{ github.event.schedule }}
+        run: python scanner.py
+      - name: Commit journal and state
+        if: always()
+        run: |
+          git config user.name "scanner-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git pull --rebase || true
+          git add journal.csv state.json 2>/dev/null || true
+          git commit -m "scanner am $(date -u +%F-%H%M)" || echo "nothing to commit"
+          git push || echo "nothing to push"
