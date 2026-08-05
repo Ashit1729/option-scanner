@@ -27,7 +27,8 @@ JOURNAL = "journal.csv"
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
 LOOKBACK_DAYS = 7
 ASSUMED_DELTA = 0.40
-TARGET_PCT = 0.10          # the +10%-on-premium goal from your rules
+TARGET_PCT = 0.40          # take profit at +40% of premium
+STOP_PCT = 0.20            # give up at -20% of premium
 
 PAPER_START = dt.date(2026, 8, 3)
 PAPER_WEEKS = 4
@@ -80,15 +81,18 @@ def grade_fired_row(r) -> dict:
     is_call = r["direction"] == "CALL"
     req_move = TARGET_PCT * ask / ASSUMED_DELTA   # underlying move for ~+10%
 
+    stop_move = STOP_PCT * ask / ASSUMED_DELTA   # underlying move for -20%
     for _, bar in df.iterrows():
         close = float(bar["Close"])
         fav = (close - entry) if is_call else (entry - close)
-        bad = (close < invalid) if is_call else (close > invalid)
+        chart_hit = (close < invalid) if is_call else (close > invalid)
+        prem_hit = fav <= -stop_move
         if fav >= req_move:
             return {"verdict": "WIN", "pnl": TARGET_PCT * ask * 100}
-        if bad:
-            adverse = (entry - invalid) if is_call else (invalid - entry)
-            loss = min(adverse * ASSUMED_DELTA * 100, ask * 100)
+        if chart_hit or prem_hit:
+            adverse = min(-fav, stop_move) if prem_hit else (
+                (entry - invalid) if is_call else (invalid - entry))
+            loss = min(abs(adverse) * ASSUMED_DELTA * 100, ask * 100)
             return {"verdict": "LOSS", "pnl": -loss}
     # neither hit by close: mark to the day's last close
     last = float(df["Close"].iloc[-1])
