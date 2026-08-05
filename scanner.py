@@ -40,12 +40,16 @@ ET = ZoneInfo("America/New_York")
 WATCHLIST = ["NVDA", "AAPL", "GOOGL", "MSFT", "AMZN",
              "AVGO", "META", "JPM", "BRK-B", "MU",
              "LLY", "TSLA", "AMD", "XOM", "JNJ",
-             "V", "WMT", "MA", "CSCO", "ABBV", "QQQ", "IWM", "SPY"]
+             "V", "WMT", "MA", "CSCO", "ABBV"]
 
 ACCOUNT_SIZE = 1000.0     # used only to show risk as a % of your account
-MAX_RISK = 400.0          # worst case on a long option = the full premium
+MAX_RISK = 200.0          # worst case on a long option = the full premium
                           # NOTE: this now gates the ESTIMATED ENTRY cost,
                           # not the current ask, because you buy later.
+MAX_PREMIUM = 4.00        # max per-share ask, i.e. $400 per contract.
+                          # Binds alongside MAX_RISK; the tighter one wins.
+TARGET_PCT = 0.40         # take profit at +40% of premium paid
+STOP_PCT = 0.20           # give up at -20% of premium paid
 DELTA_TARGET = 0.45       # preferred delta at entry
 DELTA_MIN, DELTA_MAX = 0.30, 0.60
 RISK_FREE = 0.04          # only used for the Black-Scholes estimate
@@ -56,7 +60,7 @@ MAX_ACTIVE = 15           # ceiling on simultaneously watched setups
 PIVOT_WINGS = 2
 ZONE_CLUSTER_PCT = 0.006
 MIN_TOUCHES = 2
-NEAR_PCT = 0.02
+NEAR_PCT = 0.012
 
 # Liquidity gates (Lesson 2)
 MIN_OI = 500
@@ -339,7 +343,7 @@ def pick_contract(sym: str, direction: str, trigger: float, spot: float):
                  "entry_ask": entry_ask, "entry_cost": entry_ask * 100,
                  "delta": g["delta"], "theta": g["theta"],
                  "theta_pct": (abs(g["theta"]) / max(entry_ask, 0.01)) * 100}
-            if k["entry_cost"] > MAX_RISK:
+            if k["entry_cost"] > MAX_RISK or k["entry_ask"] > MAX_PREMIUM:
                 if too_pricey is None or k["entry_cost"] < too_pricey["entry_cost"]:
                     too_pricey = k
                 continue
@@ -350,7 +354,8 @@ def pick_contract(sym: str, direction: str, trigger: float, spot: float):
         if too_pricey:
             return None, (f"cheapest liquid contract would cost about "
                           f"${too_pricey['entry_cost']:.0f} at the trigger "
-                          f"(> ${MAX_RISK:.0f} cap)")
+                          f"(caps: ${MAX_RISK:.0f} total / "
+                          f"${MAX_PREMIUM:.2f} per share)")
         return None, "no strike passed liquidity gates"
 
     cands.sort(key=lambda c: abs(abs(c["delta"]) - DELTA_TARGET))
@@ -445,6 +450,36 @@ def log_candidate(c: dict) -> None:
     c["logged"] = True
 
 
+def stock_price_for_premium(target_ask, K, T, sig, call, anchor_px,
+                            entry_ask=None):
+    """Underlying price at which the option's ASK is worth target_ask.
+
+    Quotes sit above model value (spread, skew), so we scale the target back
+    into model space using the observed ask/model ratio at the trigger, then
+    bisect. Searches both directions, since a stop level sits below the
+    trigger for a call and above it for a put."""
+    model_here = bs(anchor_px, K, T, sig, call)["price"]
+    ratio = (entry_ask / model_here) if (entry_ask and model_here > 0.01) else 1.0
+    ratio = min(max(ratio, 0.5), 2.0)
+    target_model = target_ask / ratio
+
+    lo, hi = anchor_px * 0.70, anchor_px * 1.40
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        px = bs(mid, K, T, sig, call)["price"]
+        if call:
+            if px < target_model:
+                lo = mid
+            else:
+                hi = mid
+        else:
+            if px < target_model:
+                hi = mid
+            else:
+                lo = mid
+    return (lo + hi) / 2
+
+
 def build_card(c: dict, k: dict, earn_note: str) -> str:
     """Readable card: a monospaced block for the numbers, plain text for
     the plan. Every price is labelled with WHEN it applies."""
@@ -458,19 +493,26 @@ def build_card(c: dict, k: dict, earn_note: str) -> str:
     dist = (c["trigger"] - c["price"]) / c["price"] * 100
     inval = (c["invalid"] - c["price"]) / c["price"] * 100
 
-    # stock move needed for +10% on the option, solved on the model
     T = max(k["dte"], 1) / 365.0
-    tgt_prem = k["entry_ask"] * 1.10
-    lo, hi = c["trigger"], c["trigger"] * (1.15 if call else 0.85)
-    for _ in range(50):
-        mid = (lo + hi) / 2
-        px = bs(mid, k["strike"], T, k["iv_pct"] / 100, call)["price"]
-        if (px < tgt_prem) == call:
-            lo = mid
-        else:
-            hi = mid
-    tgt_stock = hi
+    iv = k["iv_pct"] / 100
+    tgt_prem = k["entry_ask"] * (1 + TARGET_PCT)
+    stop_prem = k["entry_ask"] * (1 - STOP_PCT)
+    tgt_stock = stock_price_for_premium(tgt_prem, k["strike"], T, iv, call,
+                                        c["trigger"], k["entry_ask"])
+    stop_stock = stock_price_for_premium(stop_prem, k["strike"], T, iv, call,
+                                         c["trigger"], k["entry_ask"])
     tgt_move = (tgt_stock - c["trigger"]) / c["trigger"] * 100
+    stop_move = (stop_stock - c["trigger"]) / c["trigger"] * 100
+
+    # which stop bites first: the chart level or the -20% premium rule?
+    chart_first = ((c["invalid"] > stop_stock) if call
+                   else (c["invalid"] < stop_stock))
+    first_stop = ("chart level" if chart_first else f"-{STOP_PCT*100:.0f}% premium")
+
+    # break-even win rate AFTER this contract's own round-trip spread
+    spr = k["spread_pct"] / 100
+    net_w, net_l = TARGET_PCT - spr, STOP_PCT + spr
+    be_wr = net_l / (net_l + net_w) * 100
 
     pct_acct = k["entry_cost"] / ACCOUNT_SIZE * 100
     delta_flag = "" if k.get("delta_ok", True) else "  ⚠️ outside 0.30-0.60"
@@ -501,9 +543,20 @@ def build_card(c: dict, k: dict, earn_note: str) -> str:
         f"${ACCOUNT_SIZE:,.0f}\n"
         f"  max loss       ${k['entry_cost']:.0f}   (full premium on a gap)\n"
         f"\n"
-        f"+10% TARGET\n"
-        f"  option         ${tgt_prem:.2f}   = ${tgt_prem * 100:.0f}\n"
-        f"  needs stock    ${tgt_stock:.2f}   {tgt_move:+.2f}% past trigger\n"
+        f"EXITS      (from an entry near ${k['entry_ask']:.2f})\n"
+        f"  take profit    ${tgt_prem:>9.2f}   = ${tgt_prem * 100:.0f}"
+        f"   {TARGET_PCT*100:+.0f}%\n"
+        f"    needs stock  ${tgt_stock:>9.2f}   {tgt_move:+.2f}% past trigger\n"
+        f"  premium stop   ${stop_prem:>9.2f}   = ${stop_prem * 100:.0f}"
+        f"   {-STOP_PCT*100:+.0f}%\n"
+        f"    at stock     ${stop_stock:>9.2f}   {stop_move:+.2f}%\n"
+        f"  chart invalid  ${c['invalid']:>9.2f}   {inval:+.2f}%\n"
+        f"  -> {first_stop} triggers first; obey whichever comes first\n"
+        f"\n"
+        f"EDGE NEEDED\n"
+        f"  spread cost    {k['spread_pct']:.1f}% round trip\n"
+        f"  net win/loss   {net_w*100:+.0f}% / {-net_l*100:+.0f}%\n"
+        f"  break-even WR  {be_wr:.0f}%   <- you must beat this to profit\n"
     )
 
     late = ("\n🌙 Late session — holding past 16:00 risks an overnight gap, "
@@ -517,8 +570,10 @@ def build_card(c: dict, k: dict, earn_note: str) -> str:
         f"📍 **Set a broker alert at {c['trigger']:.2f} now.**\n"
         f"✅ Enter only if a 5-min candle CLOSES {above} "
         f"{c['trigger']:.2f} on above-average volume.\n"
-        f"🛑 Wrong the moment a 5-min candle closes {below} "
-        f"{c['invalid']:.2f} — exit.\n"
+        f"🛑 Exit on WHICHEVER comes first: a 5-min close {below} "
+        f"{c['invalid']:.2f}, or the option hitting ${stop_prem:.2f}.\n"
+        f"🎯 Take profit at ${tgt_prem:.2f} (+{TARGET_PCT*100:.0f}%). "
+        f"Set both orders the moment you fill.\n"
         f"🔍 Greeks above are Black-Scholes estimates from the chain's IV, "
         f"and the entry price is a projection. Confirm both on your broker's "
         f"live chain before you buy.{late}"
