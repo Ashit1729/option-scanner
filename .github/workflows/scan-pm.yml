@@ -1,0 +1,51 @@
+# SAVE AT:  .github/workflows/scan-pm.yml
+#
+# Afternoon session, 12:45 -> 16:05 ET.
+# Two crons per daylight-saving regime, 20 minutes apart, so a dropped
+# 12:48 slot gets a second chance at 13:08. Whichever starts first does the
+# work; the rest exit in seconds via the shared concurrency group.
+
+name: Scanner PM
+
+on:
+  schedule:
+    - cron: '48 16 * * 1-5'   # 12:48 ET summer
+    - cron: '08 17 * * 1-5'   # 13:08 ET summer (fallback)
+    - cron: '48 17 * * 1-5'   # 12:48 ET winter
+    - cron: '08 18 * * 1-5'   # 13:08 ET winter (fallback)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scanner-pm
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run PM scanner
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SESSION: pm
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+          CRON_SCHEDULE: ${{ github.event.schedule }}
+        run: python scanner.py
+      - name: Commit journal and state
+        if: always()
+        run: |
+          git config user.name "scanner-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git pull --rebase || true
+          git add journal.csv state.json 2>/dev/null || true
+          git commit -m "scanner pm $(date -u +%F-%H%M)" || echo "nothing to commit"
+          git push || echo "nothing to push"
