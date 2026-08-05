@@ -40,10 +40,10 @@ ET = ZoneInfo("America/New_York")
 WATCHLIST = ["NVDA", "AAPL", "GOOGL", "MSFT", "AMZN",
              "AVGO", "META", "JPM", "BRK-B", "MU",
              "LLY", "TSLA", "AMD", "XOM", "JNJ",
-             "V", "WMT", "MA", "CSCO", "ABBV","QQQ", "IWM", "SPY"]
+             "V", "WMT", "MA", "CSCO", "ABBV"]
 
 ACCOUNT_SIZE = 1000.0     # used only to show risk as a % of your account
-MAX_RISK = 400.0          # worst case on a long option = the full premium
+MAX_RISK = 200.0          # worst case on a long option = the full premium
                           # NOTE: this now gates the ESTIMATED ENTRY cost,
                           # not the current ask, because you buy later.
 MAX_PREMIUM = 4.00        # max per-share ask, i.e. $400 per contract.
@@ -60,7 +60,7 @@ MAX_ACTIVE = 15           # ceiling on simultaneously watched setups
 PIVOT_WINGS = 2
 ZONE_CLUSTER_PCT = 0.006
 MIN_TOUCHES = 2
-NEAR_PCT = 0.02
+NEAR_PCT = 0.012
 
 # Liquidity gates (Lesson 2)
 MIN_OI = 500
@@ -97,6 +97,8 @@ LATE_START_WARN = 30      # tell Discord if a session starts this late
 
 NO_NEW_AFTER = (15, 30)       # stop opening new ideas this late
 OVERNIGHT_WARN_AFTER = (15, 0)
+HEARTBEAT = True              # post a one-line "still alive" after every
+                              # rescan, even when nothing is found
 RESCAN_EVERY = 1800           # seconds between full watchlist rescans
 CHECK_EVERY = 120             # seconds between 5-min bar polls
 
@@ -701,6 +703,19 @@ def load_state() -> list:
         return []
 
 
+def run_link() -> str:
+    """Clickable link straight to this GitHub Actions run, when available."""
+    srv = os.environ.get("GITHUB_SERVER_URL", "")
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    rid = os.environ.get("GITHUB_RUN_ID", "")
+    if srv and repo and rid:
+        return f"\n🔗 <{srv}/{repo}/actions/runs/{rid}>"
+    return ""
+
+
+STATS = {"scans": 0, "cards": 0, "skips": 0, "fired": 0, "invalid": 0}
+
+
 def post_results(fresh: list, active: list, quiet_if_empty: bool = True) -> int:
     """Turn rescan output into Discord cards. Returns how many were posted."""
     cards, skips = [], []
@@ -712,6 +727,8 @@ def post_results(fresh: list, active: list, quiet_if_empty: bool = True) -> int:
         else:
             skips.append(f"⏭️ {c['ticker']} {c['direction']} setup found "
                          f"but skipped: {c['reject']}.")
+    STATS["cards"] += len(cards)
+    STATS["skips"] += len(skips)
     if not cards and not skips:
         if not quiet_if_empty:
             discord("🪑 **No setup right now.** Nothing cleared the trend, "
@@ -774,7 +791,11 @@ def main() -> None:
     spy = yf.Ticker("SPY").history(period="5d", interval="1d")
     if spy is None or spy.empty or spy.index[-1].date() != today:
         if not FORCE_RUN:
-            print("Market appears closed; exiting quietly.")
+            if SESSION == "am":
+                discord(f"🛑 **{today}** — no fresh market data, so this looks "
+                        f"like a holiday or an early close. No scan today."
+                        f"{run_link()}")
+            print("Market appears closed; exiting.")
             return
         print("No fresh SPY bar; continuing because FORCE_RUN=1.")
 
@@ -790,13 +811,16 @@ def main() -> None:
     if FORCE_RUN and mins_now() >= hm(end):
         pass                       # banner suppressed; test_pass() speaks
     elif SESSION == "am":
-        discord(f"🌅 **{today} — AM session live.** Watching {len(WATCHLIST)} "
-                f"names, rescanning every 30 min until 12:40, then the PM "
-                f"session takes over until 16:05. {paper_status()}")
+        discord(f"🌅 **{today} — AM SESSION STARTED** {now_et():%H:%M} ET\n"
+                f"Watching {len(WATCHLIST)} names · rescan every "
+                f"{RESCAN_EVERY // 60} min · runs until "
+                f"{hm(end)//60:02d}:{hm(end)%60:02d}, then PM takes over.\n"
+                f"{paper_status()}{run_link()}")
     elif SESSION == "pm":
-        discord(f"🌇 **PM session live** — carrying {len(active)} setup(s) "
-                f"from this morning, still rescanning every 30 min "
-                f"until 16:05.")
+        discord(f"🌇 **PM SESSION STARTED** {now_et():%H:%M} ET\n"
+                f"Carrying {len(active)} setup(s) from this morning · "
+                f"rescan every {RESCAN_EVERY // 60} min · runs until "
+                f"{hm(end)//60:02d}:{hm(end)%60:02d}.{run_link()}")
 
     end_mins = hm(end)
     if FORCE_RUN and mins_now() >= end_mins:
@@ -808,12 +832,25 @@ def main() -> None:
         if time.time() - last_scan >= RESCAN_EVERY:
             last_scan = time.time()
             if mins_now() < hm(NO_NEW_AFTER):
+                STATS["scans"] += 1
+                before = STATS["cards"]
                 try:
                     fresh = rescan(seen, len([c for c in active if not c["invalidated"]]))
                 except Exception as e:
                     fresh = []
                     print("rescan error:", e)
+                    discord(f"⚠️ Scan {STATS['scans']} hit a data error "
+                            f"({type(e).__name__}). Still running; will retry "
+                            f"in {RESCAN_EVERY // 60} min.")
                 post_results(fresh, active)
+                if HEARTBEAT and STATS["cards"] == before:
+                    watching = len([c for c in active if not c["invalidated"]])
+                    nxt = mins_now() + RESCAN_EVERY // 60
+                    nxt_txt = (f"{nxt//60:02d}:{nxt%60:02d}"
+                               if nxt < hm(NO_NEW_AFTER) else "no more today")
+                    discord(f"⏱️ {now_et():%H:%M} ET · scan #{STATS['scans']} · "
+                            f"**0 new setups** · {len(WATCHLIST)} names checked · "
+                            f"{watching} being watched · next scan {nxt_txt}")
         try:
             poll(active)
         except Exception as e:
@@ -823,20 +860,33 @@ def main() -> None:
     for c in active:
         log_candidate(c)
 
+    fired = len([c for c in active if c["fired"]])
+    summary = (f"scans {STATS['scans']} · cards {STATS['cards']} · "
+               f"skipped {STATS['skips']} · triggers fired {fired}")
+
     if SESSION == "am":
         save_state(active)
+        carry = len([c for c in active if not c["invalidated"]])
+        discord(f"🔚 **AM SESSION ENDED** {now_et():%H:%M} ET\n"
+                f"{summary}\n"
+                f"Handing {carry} setup(s) to the PM session, which starts "
+                f"around {SESSIONS['pm'][0][0]:02d}:{SESSIONS['pm'][0][1]:02d} ET."
+                f"{run_link()}")
         print("AM done; state handed to PM.")
     else:
         live = [c for c in active if c["fired"] and not c["invalidated"]]
         if live:
-            discord("🔔 **16:05 — close.** You still show "
-                    f"{len(live)} triggered setup(s) open. Anything held "
-                    f"overnight risks a gap, and a gap can cost the full "
-                    f"premium no matter where your stop sits. Decide "
-                    f"deliberately, not by default.")
+            discord(f"🔚 **PM SESSION ENDED — market close** {now_et():%H:%M} ET\n"
+                    f"{summary}\n"
+                    f"You still show {len(live)} triggered setup(s) open. "
+                    f"Anything held overnight risks a gap, and a gap can cost "
+                    f"the full premium no matter where your stop sits. Decide "
+                    f"deliberately, not by default.{run_link()}")
         else:
-            discord("🌙 **16:05 — close.** Nothing left open. "
-                    "Quiet days cost nothing; forced trades do.")
+            discord(f"🔚 **PM SESSION ENDED — market close** {now_et():%H:%M} ET\n"
+                    f"{summary}\n"
+                    f"Nothing left open. Quiet days cost nothing; forced "
+                    f"trades do. Next scan tomorrow morning.{run_link()}")
         try:
             os.remove(STATE)
         except OSError:
