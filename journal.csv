@@ -54,3 +54,4 @@ run_date,session,ticker,direction,setup,price,zone_lo,zone_hi,trigger,invalid,ex
 2026-08-20 10:10 ET,am,SPY,CALL,breakout watch,766.61,775.05,779.37,779.37,775.05,2026-08-26,781.0,0.3,6.7,551,17,9.1,30.0,True,N,,,N,
 2026-08-20 11:10 ET,am,NVDA,CALL,breakout watch,217.4,216.2,217.91,217.91,216.2,2026-08-28,227.5,3.3,1.5,5975,777,51.9,330.0,True,N,,,N,
 2026-08-20 11:41 ET,am,AVGO,PUT,breakdown watch,363.48,356.43,357.8,356.43,357.8,2026-08-28,330.0,0.77,0.0,1112,37,42.5,77.0,True,N,,,N,
+2026-08-20 13:12 ET,pm,GOOGL,PUT,breakdown watch,341.61,340.88,342.32,340.88,342.32,2026-09-04,330.0,3.3,3.0,1674,164,27.7,330.0,True,N,,,N,
