@@ -62,3 +62,4 @@ run_date,session,ticker,direction,setup,price,zone_lo,zone_hi,trigger,invalid,ex
 2026-08-24 10:19 ET,am,AAPL,CALL,breakout watch,313.07,316.29,317.4,317.4,316.29,2026-08-31,325.0,0.72,5.6,959,111,22.7,72.0,True,N,,,N,
 2026-08-24 11:50 ET,am,SPY,CALL,breakout watch,764.29,775.05,779.37,779.37,775.05,2026-08-31,781.0,0.29,3.4,1098,323,9.5,29.0,True,N,,,N,
 2026-08-25 10:22 ET,am,SPY,CALL,breakout watch,765.13,775.05,779.37,779.37,775.05,2026-08-31,781.0,0.31,3.2,1277,11,9.9,31.0,True,N,,,N,
+2026-08-25 13:17 ET,pm,GOOGL,PUT,breakdown watch,347.09,340.88,342.32,340.88,342.32,2026-09-04,325.0,0.71,5.6,818,89,28.5,71.0,True,N,,,N,
